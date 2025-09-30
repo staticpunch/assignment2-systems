@@ -10,6 +10,7 @@ from pathlib import Path
 
 # Model configuration dictionaries
 CONFIGS = json.load(open("model_configs.json", "r"))
+    
 
 def setup_logging(log_level: str = "INFO", log_file: str = None) -> logging.Logger:
     """Setup logging configuration."""
@@ -78,6 +79,7 @@ def benchmark(
 
     def backward():
         output = model(X)
+        # import pdb; pdb.set_trace()
         loss = ((Y - output) ** 2).sum()
         loss.backward()
 
