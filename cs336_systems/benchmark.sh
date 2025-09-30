@@ -1,1 +1,0 @@
-nsys profile -o nsys_results/small python benchmark.py --configs small --num-warmups 5 --end-to-end --log-level INFO

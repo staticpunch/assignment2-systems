@@ -13,21 +13,15 @@ from nn_utils import cross_entropy
 
 # Model configuration dictionaries
 CONFIGS = json.load(open("model_configs.json", "r"))
+logger = logging.getLogger(__name__)
 
 def setup_logging(log_level: str = "INFO") -> logging.Logger:
     """Setup logging configuration."""
-    logger = logging.getLogger(__name__)
     logger.setLevel(getattr(logging, log_level.upper()))
-    
-    # Clear any existing handlers
     logger.handlers.clear()
-    
-    # Create formatter
     formatter = logging.Formatter(
         '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
-    
-    # Console handler
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
@@ -78,6 +72,13 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help='Batch size for benchmarking'
     )
+
+    parser.add_argument(
+        '--num-warmups', 
+        type=int, 
+        default=10,
+        help='Number of warmup steps'
+    )
     
     parser.add_argument(
         '--num-steps', 
@@ -94,14 +95,25 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        '--use-optimizer', 
+        '--mode', 
+        choices=['forward', 'grad', 'train'], 
+        default='forward',
+        help=("Running modes:\n"
+            "  `forward`: Running forward pass only.\n"
+            "  `grad`: Running forward and backward passes.\n"
+            "  `train`: Running full training steps."
+        )
+    )
+
+    parser.add_argument(
+        '--annotate_attention', 
         action='store_true',
-        help='Include optimizer.step()'
+        help='Add NVTX annotatton to scaled dot product attention'
     )
 
     return parser.parse_args()
 
-def run_training(args):
+def profiling(args):
 
     # Define a model (with random weights)
     cfg = CONFIGS[args.config]
@@ -110,10 +122,14 @@ def run_training(args):
     device = get_device(args.gpu_index)
     
     with nvtx.range("define_model"):
+        if args.annotate_attention:
+            logger.info("Replacing scaled_dot_product_attention to NVTX annotated version.")
+            from attention import annotated_scaled_dot_product_attention
+            nn.scaled_dot_product_attention = annotated_scaled_dot_product_attention
         model = nn.BasicsTransformerLM(**cfg).to(device)
     
     # Initialize optimizer if requested
-    if args.use_optimizer:
+    if args.mode == "train":
         optimizer = optim.AdamW(model.parameters())
 
     # Define an input and output
@@ -126,42 +142,53 @@ def run_training(args):
         labels = torch.randint(0, vocab_size, (args.batch_size, args.sequence_length))
         labels = labels.to(next(model.parameters()).device)
 
-    # Run the model `num_steps` times
-    for step in range(args.num_steps):
-        if step > 10:
-            # start profiling after 10 warmup iterations
-            torch.cuda.cudart().cudaProfilerStart()
+    def _forward():
+        model.zero_grad(set_to_none=True)
+        with nvtx.range("forward"):
+            logits = model(X)
+            loss = cross_entropy(logits, labels)
 
-        nvtx.range_push(f"step_{step}")
-        
-        # Zero gradients
-        if args.use_optimizer:
-            optimizer.zero_grad()
-        else:
-            model.zero_grad(set_to_none=True)
-
-        # Forward
+    def _grad():
+        model.zero_grad(set_to_none=True)
         with nvtx.range("forward"):
             logits = model(X) # (args.batch_size, args.sequence_length, vocab_size)
             loss = cross_entropy(logits, labels)
-
-        # Backward
         with nvtx.range("backward"):
             loss.backward()
 
-        # Optimizer step if enabled
-        if args.use_optimizer:
-            with nvtx.range("optimizer_step"):
-                #print(f"Step {step}, loss: {y.item():.6f}")
-                optimizer.step()
+    def _train():
+        optimizer.zero_grad()
+        with nvtx.range("forward"):
+            logits = model(X) # (args.batch_size, args.sequence_length, vocab_size)
+            loss = cross_entropy(logits, labels)
+        with nvtx.range("backward"):
+            loss.backward()
+        with nvtx.range("optimizer_step"):
+            optimizer.step()
+
+    RUN_MAPPER = {
+        "forward": _forward,
+        "grad": _grad,
+        "train": _train
+    }
+    run = RUN_MAPPER[args.mode]
+
+    for _ in range(args.num_warmups): run()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
         
+    for step in range(args.num_steps):
+        # # start profiling after 10 warmup iterations
+        # if step > args.num_warmups: 
+        #     torch.cuda.cudart().cudaProfilerStart()
+        nvtx.range_push(f"step_{step}")
+        run()
         nvtx.range_pop()
 
 def main():
     args = parse_args()
-    global logger
-    logger = setup_logging(log_level=args.log_level)
-    run_training(args)
+    setup_logging(log_level=args.log_level)
+    profiling(args)
 
 if __name__ == "__main__":
     main()

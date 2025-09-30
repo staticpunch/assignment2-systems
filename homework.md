@@ -24,8 +24,10 @@ Profile your forward pass, backward pass, and optimizer step using `nsys` with e
 <br>
 
 **Answer:**
-> *Your answer here.*
-
+> The CUDA kernel(s) taking the most GPU time during forward: <br>
+    1. `ampere_sgemm_128x64_tn: ~50%, 217 instances` <br>
+    2. `ampere_sgemm_64x32_sliced1x4_tn: ~20%, 36 instances` <br>
+> These two kernels take almost identifical time during forward in both `forward (fwd only)` and `grad (fwd and bwd)` configs.
 ---
 (c) Although the vast majority of FLOPs take place in matrix multiplications, you will notice that several other kernels still take a non-trivial amount of the overall runtime. What other kernels besides matrix multiplies do you see accounting for non-trivial CUDA runtime in the forward pass?
 
@@ -34,7 +36,7 @@ Profile your forward pass, backward pass, and optimizer step using `nsys` with e
 <br>
 
 **Answer:**
-> *Your answer here.*
+> Elementwise kernels. (~10%)
 
 ---
 
