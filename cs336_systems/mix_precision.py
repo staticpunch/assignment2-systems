@@ -2,15 +2,14 @@ import torch.nn as nn
 import torch
 import logging
 import argparse
-logger = logging.getLogger(__name__)
+from contextlib import nullcontext
+import torch.cuda.nvtx as nvtx
 
+logger = logging.getLogger(__name__)
 def setup_logging(log_level: str = "INFO") -> logging.Logger:
     """Setup logging configuration."""
     logger.setLevel(getattr(logging, log_level.upper()))
     logger.handlers.clear()
-    # formatter = logging.Formatter(
-    #     '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    # )
     formatter = logging.Formatter("%(message)s")
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
@@ -65,13 +64,13 @@ class Trainer:
         loss = ((y - outputs) ** 2).sum()
         logger.info(f"  loss: {loss.dtype}")
         loss.backward()
-        logger.info(f"BACKWARD PASS: model's gradients: {self.model.fc1.weight.grad.dtype}")
+        logger.info(f"BACKWARD PASS:\n  model's gradients: {self.model.fc1.weight.grad.dtype}")
         self.optimizer.step()
 
     def train(self):
-        logger.info(f"MODEL INIT: model parameters: {next(self.model.parameters()).dtype}")
+        logger.info(f"MODEL INIT:\n  model parameters: {next(self.model.parameters()).dtype}")
         x, y = self.data[0], self.data[1]
-        for step in range(self.num_steps): 
+        for step in range(self.num_steps):
             self.step(x, y)
 
 def parse_args() -> argparse.Namespace:
@@ -81,9 +80,11 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        '--autocast', 
-        action='store_true',
-        help='Use mixed precision training'
+        '--dtype', 
+        type=str,
+        default='fp32',
+        choices=['fp32', 'fp16', 'bf16'],
+        help='Data type for training: fp32 (full precision), fp16 (half precision), or bf16 (bfloat16)'
     )
 
     return parser.parse_args()
@@ -101,39 +102,24 @@ def train():
     optimizer = torch.optim.Adam(model.parameters())
     trainer = Trainer(model, data, optimizer)
 
-    dtype = torch.float16
-    if args.autocast:
-        with torch.autocast(device_type="cuda:0", dtype=dtype):
-            logger.info("Training with mixed precsion.")
-            trainer.train()
+    # Map dtype string to torch dtype and determine context
+    dtype_map = {
+        'fp32': torch.float32,
+        'fp16': torch.float16,
+        'bf16': torch.bfloat16
+    }
+    
+    dtype = dtype_map[args.dtype]
+    
+    if args.dtype == 'fp32':
+        context = nullcontext()
+        logger.info("Training with full precision (fp32).")
     else:
-        logger.info("Training with full precsion.")
+        context = torch.autocast(device_type="cuda", dtype=dtype)
+        logger.info(f"Training with mixed precision ({args.dtype}).")
+    
+    with context:
         trainer.train()
 
 if __name__ == "__main__":
-    """
-    ```
-    $ python mix_precision.py --autocast
-    Using GPU: NVIDIA GeForce RTX 3090
-    Training with mixed precsion.
-    MODEL INIT: model parameters: torch.float32
-    FORWARD PASS:
-      first feed-forward: torch.float16
-      layer norm: torch.float32
-      second feed-forward (logits): torch.float16
-      loss: torch.float32
-    BACKWARD PASS: model's gradients: torch.float32
-    
-    $ python mix_precision.py
-    Using GPU: NVIDIA GeForce RTX 3090
-    Training with full precsion.
-    MODEL INIT: model parameters: torch.float32
-    FORWARD PASS:
-      first feed-forward: torch.float32
-      layer norm: torch.float32
-      second feed-forward (logits): torch.float32
-      loss: torch.float32
-    BACKWARD PASS: model's gradients: torch.float32
-    ```
-    """
     train()

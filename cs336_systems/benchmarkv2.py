@@ -2,18 +2,18 @@ import cs336_basics as lib
 import cs336_basics.model as nn
 import cs336_basics.optimizer as optim
 import torch
-import torch.cuda.nvtx as nvtx
 import timeit
 import argparse
 import logging
 import json
 from typing import Callable, Dict, Any
 from pathlib import Path
+from contextlib import nullcontext
 from nn_utils import cross_entropy
 
 # Model configuration dictionaries
 CONFIGS = json.load(open("model_configs.json", "r"))
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("benchmarking")
 
 def setup_logging(log_level: str = "INFO") -> logging.Logger:
     """Setup logging configuration."""
@@ -37,6 +37,16 @@ def get_device(index: int = 0) -> torch.device:
     else:
         logger.info("CUDA not available, using CPU")
         return torch.device("cpu")
+
+def mean(x: list[float]) -> float:
+    return sum(x) / len(x)
+
+def std(x: list[float]) -> float:
+    if len(x) <= 1:
+        return 0.0
+    mu = mean(x)
+    return (sum((xi - mu) ** 2 for xi in x) / (len(x) - 1)) ** 0.5
+
 
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
@@ -106,14 +116,16 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        '--annotate_attention', 
-        action='store_true',
-        help='Add NVTX annotatton to scaled dot product attention'
+        '--dtype', 
+        type=str,
+        default='fp32',
+        choices=['fp32', 'fp16', 'bf16'],
+        help='Data type for training: fp32 (full precision), fp16 (half precision), or bf16 (bfloat16)'
     )
 
     return parser.parse_args()
 
-def profiling(args):
+def benchmarking(args):
 
     # Define a model (with random weights)
     cfg = CONFIGS[args.config]
@@ -121,52 +133,41 @@ def profiling(args):
     logger.info(f"Model parameters: {cfg}")
     device = get_device(args.gpu_index)
     
-    with nvtx.range("define_model"):
-        if args.annotate_attention:
-            logger.info("Replacing scaled_dot_product_attention to NVTX annotated version.")
-            from attention import annotated_scaled_dot_product_attention
-            nn.scaled_dot_product_attention = annotated_scaled_dot_product_attention
-        model = nn.BasicsTransformerLM(**cfg).to(device)
-        num_params = sum(p.numel() for p in model.parameters())
-        logger.info(f"Model {args.config} loaded with {num_params:,} parameters")
+
+    model = nn.BasicsTransformerLM(**cfg).to(device)
+    num_params = sum(p.numel() for p in model.parameters())
+    logger.info(f"Model {args.config} loaded with {num_params:,} parameters")
     
     # Initialize optimizer if requested
     if args.mode == "train":
         optimizer = optim.AdamW(model.parameters())
 
     # Define an input and output
-    with nvtx.range("define_input_output"):
-        vocab_size = model.vocab_size
-        X = torch.randint(
-            high=vocab_size, size=(args.batch_size, args.sequence_length),
-            device=next(model.parameters()).device
-        )
-        labels = torch.randint(0, vocab_size, (args.batch_size, args.sequence_length))
-        labels = labels.to(next(model.parameters()).device)
+    vocab_size = model.vocab_size
+    X = torch.randint(
+        high=vocab_size, size=(args.batch_size, args.sequence_length),
+        device=next(model.parameters()).device
+    )
+    labels = torch.randint(0, vocab_size, (args.batch_size, args.sequence_length))
+    labels = labels.to(next(model.parameters()).device)
 
     def _forward():
         model.zero_grad(set_to_none=True)
-        with nvtx.range("forward"):
-            logits = model(X)
-            loss = cross_entropy(logits, labels)
+        logits = model(X) # (args.batch_size, args.sequence_length, vocab_size)
+        loss = cross_entropy(logits, labels)
 
     def _grad():
         model.zero_grad(set_to_none=True)
-        with nvtx.range("forward"):
-            logits = model(X) # (args.batch_size, args.sequence_length, vocab_size)
-            loss = cross_entropy(logits, labels)
-        with nvtx.range("backward"):
-            loss.backward()
+        logits = model(X) # (args.batch_size, args.sequence_length, vocab_size)
+        loss = cross_entropy(logits, labels)
+        loss.backward()
 
     def _train():
         optimizer.zero_grad()
-        with nvtx.range("forward"):
-            logits = model(X) # (args.batch_size, args.sequence_length, vocab_size)
-            loss = cross_entropy(logits, labels)
-        with nvtx.range("backward"):
-            loss.backward()
-        with nvtx.range("optimizer_step"):
-            optimizer.step()
+        logits = model(X) # (args.batch_size, args.sequence_length, vocab_size)
+        loss = cross_entropy(logits, labels)
+        loss.backward()
+        optimizer.step()
 
     RUN_MAPPER = {
         "forward": _forward,
@@ -175,22 +176,57 @@ def profiling(args):
     }
     run = RUN_MAPPER[args.mode]
 
+    
+    if args.dtype == "fp32":
+        logger.info("Running with full precision (fp32).")
+    else:
+        logger.info(f"Running with mixed precision ({args.dtype}).")
+    logger.info(f"Running {args.num_warmups} warmup iterations...")
     for _ in range(args.num_warmups): run()
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-        
+
+    logger.info(f"Running {args.num_steps} benchmark iterations...")
+    times: list[float] = []
     for step in range(args.num_steps):
-        # # start profiling after 10 warmup iterations
-        # if step > args.num_warmups: 
-        #     torch.cuda.cudart().cudaProfilerStart()
-        nvtx.range_push(f"step_{step}")
+        start_time = timeit.default_timer()
         run()
-        nvtx.range_pop()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        end_time = timeit.default_timer()
+        times.append((end_time - start_time) * 1000)
+        
+    statistics = dict(
+        mean=mean(times),
+        std=std(times),
+        min=min(times),
+        max=max(times)
+    )
+    statistics = {k: f"{v:6.2f}" for k, v in statistics.items()}
+    return statistics
+
+def make_context(dtype, gpu_index):
+    dtype_map = {
+        'fp32': torch.float32,
+        'fp16': torch.float16,
+        'bf16': torch.bfloat16
+    }   
+    dtype = dtype_map[dtype]
+    device = f"cuda:{gpu_index}" if torch.cuda.is_available() else "cpu"
+    context = nullcontext()
+    if dtype != torch.float32:
+        context = torch.autocast(device_type=device, dtype=dtype)
+    return context
 
 def main():
     args = parse_args()
     setup_logging(log_level=args.log_level)
-    profiling(args)
+    
+    context = make_context(args.dtype, args.gpu_index)
+    with context:
+        statistics = benchmarking(args)
+        
+    logger.info(f"Running time:\n  {statistics}")
 
 if __name__ == "__main__":
     main()
