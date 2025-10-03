@@ -8,6 +8,7 @@ import logging
 import json
 from typing import Callable, Dict, Any
 from pathlib import Path
+from functools import wraps
 from contextlib import nullcontext
 from nn_utils import cross_entropy
 
@@ -120,7 +121,13 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default='fp32',
         choices=['fp32', 'fp16', 'bf16'],
-        help='Data type for training: fp32 (full precision), fp16 (half precision), or bf16 (bfloat16)'
+        help='Data type for training: fp32, fp16, or bf16'
+    )
+
+    parser.add_argument(
+        '--memory', 
+        action='store_true',
+        help='Profiling memory usage.'
     )
 
     return parser.parse_args()
@@ -175,26 +182,22 @@ def benchmarking(args):
         "train": _train
     }
     run = RUN_MAPPER[args.mode]
-
     
-    if args.dtype == "fp32":
-        logger.info("Running with full precision (fp32).")
-    else:
-        logger.info(f"Running with mixed precision ({args.dtype}).")
-    logger.info(f"Running {args.num_warmups} warmup iterations...")
-    for _ in range(args.num_warmups): run()
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-
-    logger.info(f"Running {args.num_steps} benchmark iterations...")
-    times: list[float] = []
-    for step in range(args.num_steps):
-        start_time = timeit.default_timer()
-        run()
+    with make_context(args.dtype):
+        logger.info(f"Running {args.num_warmups} warmup iterations...")
+        for _ in range(args.num_warmups): run()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        end_time = timeit.default_timer()
-        times.append((end_time - start_time) * 1000)
+    
+        logger.info(f"Running {args.num_steps} benchmark iterations...")
+        times: list[float] = []
+        for step in range(args.num_steps):
+            start_time = timeit.default_timer()
+            run()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            end_time = timeit.default_timer()
+            times.append((end_time - start_time) * 1000)
         
     statistics = dict(
         mean=mean(times),
@@ -205,27 +208,49 @@ def benchmarking(args):
     statistics = {k: f"{v:6.2f}" for k, v in statistics.items()}
     return statistics
 
-def make_context(dtype, gpu_index):
+def memory_profiling(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if not torch.cuda.is_available():
+            logger.warning("CUDA not available, skipping memory profiling")
+            return func(*args, **kwargs)
+            
+        logger.info("Enabled memory profiling.")
+        torch.cuda.memory._record_memory_history(max_entries=100000) # Start recording memory history
+        result = func(*args, **kwargs)
+        ## Output handling
+        output_dir = Path("memory_snapshots")
+        output_dir.mkdir(exist_ok=True)
+        snapshot_file = output_dir / \
+            f"model_{args[0].config}-dtype_{args[0].dtype}-mode_{args[0].mode}.pickle"
+        torch.cuda.memory._dump_snapshot(snapshot_file)
+        torch.cuda.memory._record_memory_history(enabled=None) # Stop recording history.
+        return result
+    return wrapper
+
+def make_context(dtype):
     dtype_map = {
         'fp32': torch.float32,
         'fp16': torch.float16,
         'bf16': torch.bfloat16
     }   
     dtype = dtype_map[dtype]
-    device = f"cuda:{gpu_index}" if torch.cuda.is_available() else "cpu"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
     context = nullcontext()
-    if dtype != torch.float32:
+    if dtype == torch.float32:
+        logger.info("Running with full precision (fp32).")
+    else:
         context = torch.autocast(device_type=device, dtype=dtype)
+        logger.info(f"Running with mixed precision ({dtype}).")
     return context
 
 def main():
     args = parse_args()
     setup_logging(log_level=args.log_level)
-    
-    context = make_context(args.dtype, args.gpu_index)
-    with context:
-        statistics = benchmarking(args)
-        
+
+    run = memory_profiling(benchmarking) if args.memory else benchmarking        
+    statistics = run(args)
     logger.info(f"Running time:\n  {statistics}")
 
 if __name__ == "__main__":

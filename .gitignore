@@ -166,3 +166,4 @@ cython_debug/
 # Custom
 cs336_systems/nsys_results
 cs336_systems/torch_results
+cs336_systems/memory_snapshots

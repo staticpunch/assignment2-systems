@@ -8,6 +8,7 @@ python benchmarkv2.py \
 	--batch-size 1 \
 	--sequence-length 128 \
 	--mode grad \
+    --memory \
     --dtype fp16 / bf16 / fp32
 
 
