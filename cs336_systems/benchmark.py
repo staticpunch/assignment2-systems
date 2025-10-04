@@ -1,5 +1,6 @@
 import cs336_basics as lib
 import cs336_basics.model as nn
+import cs336_basics.optimizer as optim
 import torch
 import timeit
 import argparse
@@ -7,36 +8,24 @@ import logging
 import json
 from typing import Callable, Dict, Any
 from pathlib import Path
+from functools import wraps
+from contextlib import nullcontext
+from nn_utils import cross_entropy
 
 # Model configuration dictionaries
 CONFIGS = json.load(open("model_configs.json", "r"))
-    
+logger = logging.getLogger("benchmarking")
 
-def setup_logging(log_level: str = "INFO", log_file: str = None) -> logging.Logger:
+def setup_logging(log_level: str = "INFO") -> logging.Logger:
     """Setup logging configuration."""
-    logger = logging.getLogger(__name__)
     logger.setLevel(getattr(logging, log_level.upper()))
-    
-    # Clear any existing handlers
     logger.handlers.clear()
-    
-    # Create formatter
     formatter = logging.Formatter(
         '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
-    
-    # Console handler
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
-    
-    # File handler if specified
-    if log_file:
-        log_path = Path(log_file)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
     
     return logger
 
@@ -59,117 +48,6 @@ def std(x: list[float]) -> float:
     mu = mean(x)
     return (sum((xi - mu) ** 2 for xi in x) / (len(x) - 1)) ** 0.5
 
-def benchmark(
-    model,
-    batch_size: int = 1,
-    sequence_length: int = 64,
-    end_to_end: bool = False,
-    num_warmups: int = 1, 
-    num_trials: int = 3
-) -> Dict[str, float]:
-    """Benchmark a single model configuration."""
-    # Initialization
-    vocab_size = model.vocab_size
-    X = torch.randint(high=vocab_size, size=(batch_size, sequence_length))
-    X = X.to(next(model.parameters()).device)
-    Y = torch.ones(vocab_size).to(next(model.parameters()).device)
-
-    def forward():
-        with torch.no_grad(): model(X)
-
-    def backward():
-        output = model(X)
-        # import pdb; pdb.set_trace()
-        loss = ((Y - output) ** 2).sum()
-        loss.backward()
-
-    run = backward if end_to_end else forward
-    
-    # Warmup runs
-    logger.debug(f"Running {num_warmups} warmup iterations...")
-    for _ in range(num_warmups):
-        run()
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-
-    # Benchmark runs
-    logger.debug(f"Running {num_trials} benchmark iterations...")
-    times: list[float] = []
-    for trial in range(num_trials):
-        start_time = timeit.default_timer()
-        run()
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        end_time = timeit.default_timer()
-        times.append((end_time - start_time) * 1000)
-        
-    statistics = dict(
-        mean=mean(times),
-        std=std(times),
-        min=min(times),
-        max=max(times)
-    )
-    return statistics
-
-def benchmark_statistics(args):
-    if args.configs is None:
-        args.configs = list(CONFIGS.keys())
-    
-    logger.info(f"Starting benchmark with configs: {args.configs}")
-    logger.info(f"Parameters: batch_size={args.batch_size}, seq_len={args.sequence_length}, "
-               f"end_to_end={args.end_to_end}, warmups={args.num_warmups}, trials={args.num_trials}")
-    
-    all_statistics = {}
-    device = get_device(args.gpu_index)
-    
-    for cfg_name in args.configs:
-        if cfg_name not in CONFIGS:
-            logger.warning(f"Config '{args.cfg_name}' not found, skipping...")
-            continue
-            
-        cfg = CONFIGS[cfg_name]
-        logger.info(f"Benchmarking config: {cfg_name}")
-        logger.debug(f"Model parameters: {cfg}")
-
-        if args.annotate_attention:
-            from attention import annotated_scaled_dot_product_attention
-            nn.scaled_dot_product_attention = annotated_scaled_dot_product_attention
-
-        model = nn.BasicsTransformerLM(**cfg).to(device)
-        num_params = sum(p.numel() for p in model.parameters())
-        logger.info(f"Model {cfg_name} loaded with {num_params:,} parameters")
-        
-        statistics = benchmark(
-            model, 
-            args.batch_size, 
-            args.sequence_length,
-            args.end_to_end, 
-            args.num_warmups, 
-            args.num_trials
-        )
-        
-        all_statistics[cfg_name] = statistics
-        logger.info(
-            f"Config {cfg_name}: {statistics['mean']:.2f}±{statistics['std']:.2f}ms "
-            f"(min: {statistics['min']:.2f}ms, max: {statistics['max']:.2f}ms)"
-        )
-        
-        # Clean up
-        del model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-                
-    return all_statistics
-
-def save_results(results: Dict[str, Any], output_file: str):
-    """Save benchmark results to JSON file."""
-    output_path = Path(output_file)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    with open(output_path, 'w') as f:
-        json.dump(results, f, indent=2)
-    
-    logger.info(f"Results saved to {output_file}")
 
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
@@ -178,48 +56,11 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
-    # Model configuration
     parser.add_argument(
-        '--configs', 
-        nargs='+', 
+        '--config', 
         choices=list(CONFIGS.keys()),
-        default=None,
-        help='Model configurations to benchmark (default: all)'
-    )
-    
-    # Benchmark parameters
-    parser.add_argument(
-        '--batch-size', 
-        type=int, 
-        default=1,
-        help='Batch size for benchmarking'
-    )
-    
-    parser.add_argument(
-        '--sequence-length', 
-        type=int, 
-        default=128,
-        help='Sequence length for benchmarking'
-    )
-    
-    parser.add_argument(
-        '--end-to-end', 
-        action='store_true',
-        help='Include backward pass in benchmark (default: forward only)'
-    )
-    
-    parser.add_argument(
-        '--num-warmups', 
-        type=int, 
-        default=5,
-        help='Number of warmup iterations'
-    )
-    
-    parser.add_argument(
-        '--num-trials', 
-        type=int, 
-        default=10,
-        help='Number of benchmark trials'
+        default="small",
+        help='Model configurations to benchmark'
     )
     
     parser.add_argument(
@@ -228,75 +69,191 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help='GPU index to use (if available)'
     )
-    
-    # Logging and output
+
     parser.add_argument(
         '--log-level', 
         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], 
         default='INFO',
         help='Logging level'
     )
-    
+
     parser.add_argument(
-        '--log-file', 
-        type=str,
-        help='Log file path (optional)'
-    )
-    
-    parser.add_argument(
-        '--output-file', 
-        type=str,
-        help='Output JSON file for results (optional)'
-    )
-    
-    parser.add_argument(
-        '--quiet', 
-        action='store_true',
-        help='Suppress console output (only log to file)'
+        '--batch-size', 
+        type=int, 
+        default=1,
+        help='Batch size for benchmarking'
     )
 
     parser.add_argument(
-        '--annotate_attention', 
-        action='store_true',
-        help='Add NVTX annotatton to scaled dot product attention'
+        '--num-warmups', 
+        type=int, 
+        default=10,
+        help='Number of warmup steps'
     )
     
+    parser.add_argument(
+        '--num-steps', 
+        type=int, 
+        default=20,
+        help='Number of steps in training loop'
+    )
+    
+    parser.add_argument(
+        '--sequence-length', 
+        type=int, 
+        default=128,
+        help='Sequence length for benchmarking'
+    )
+
+    parser.add_argument(
+        '--mode', 
+        choices=['forward', 'grad', 'train'], 
+        default='forward',
+        help=("Running modes:\n"
+            "  `forward`: Running forward pass only.\n"
+            "  `grad`: Running forward and backward passes.\n"
+            "  `train`: Running full training steps."
+        )
+    )
+
+    parser.add_argument(
+        '--dtype', 
+        type=str,
+        default='fp32',
+        choices=['fp32', 'fp16', 'bf16'],
+        help='Data type for training: fp32, fp16, or bf16'
+    )
+
+    parser.add_argument(
+        '--memory', 
+        action='store_true',
+        help='Profiling memory usage.'
+    )
+
     return parser.parse_args()
 
-def main():
-    """Main function."""
-    args = parse_args()
+def benchmarking(args):
+
+    # Define a model (with random weights)
+    cfg = CONFIGS[args.config]
+    logger.info(f"Benchmarking config: {args.config}")
+    logger.info(f"Model parameters: {cfg}")
+    device = get_device(args.gpu_index)
     
-    # Setup logging
-    global logger
-    logger = setup_logging(
-        log_level=args.log_level if not args.quiet else 'ERROR',
-        log_file=args.log_file
+
+    model = nn.BasicsTransformerLM(**cfg).to(device)
+    num_params = sum(p.numel() for p in model.parameters())
+    logger.info(f"Model {args.config} loaded with {num_params:,} parameters")
+    
+    # Initialize optimizer if requested
+    if args.mode == "train":
+        optimizer = optim.AdamW(model.parameters())
+
+    # Define an input and output
+    vocab_size = model.vocab_size
+    X = torch.randint(
+        high=vocab_size, size=(args.batch_size, args.sequence_length),
+        device=next(model.parameters()).device
     )
+    labels = torch.randint(0, vocab_size, (args.batch_size, args.sequence_length))
+    labels = labels.to(next(model.parameters()).device)
+
+    def _forward():
+        model.zero_grad(set_to_none=True)
+        logits = model(X) # (args.batch_size, args.sequence_length, vocab_size)
+        loss = cross_entropy(logits, labels)
+
+    def _grad():
+        model.zero_grad(set_to_none=True)
+        logits = model(X) # (args.batch_size, args.sequence_length, vocab_size)
+        loss = cross_entropy(logits, labels)
+        loss.backward()
+
+    def _train():
+        optimizer.zero_grad()
+        logits = model(X) # (args.batch_size, args.sequence_length, vocab_size)
+        loss = cross_entropy(logits, labels)
+        loss.backward()
+        optimizer.step()
+
+    RUN_MAPPER = {
+        "forward": _forward,
+        "grad": _grad,
+        "train": _train
+    }
+    run = RUN_MAPPER[args.mode]
     
-    logger.info("Starting Transformer benchmark")
-    logger.info(f"Arguments: {vars(args)}")
+    with make_context(args.dtype):
+        logger.info(f"Running {args.num_warmups} warmup iterations...")
+        for _ in range(args.num_warmups): run()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
     
-    # Run benchmark
-    try:
-        results = benchmark_statistics(args)
-        full_results = {
-            'metadata': vars(args),
-            'results': results
-        }
-        print("Benchmark Results:")
-        for cfg_name, stats in results.items():
-            print(f"{cfg_name:>8}: {stats['mean']:6.2f} ± {stats['std']:5.2f}ms")
-        print()
+        logger.info(f"Running {args.num_steps} benchmark iterations...")
+        times: list[float] = []
+        for step in range(args.num_steps):
+            start_time = timeit.default_timer()
+            run()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            end_time = timeit.default_timer()
+            times.append((end_time - start_time) * 1000)
         
-        if args.output_file:
-            save_results(full_results, args.output_file)
+    statistics = dict(
+        mean=mean(times),
+        std=std(times),
+        min=min(times),
+        max=max(times)
+    )
+    statistics = {k: f"{v:6.2f}" for k, v in statistics.items()}
+    return statistics
+
+def memory_profiling(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if not torch.cuda.is_available():
+            logger.warning("CUDA not available, skipping memory profiling")
+            return func(*args, **kwargs)
             
-    except KeyboardInterrupt:
-        logger.info("Benchmark interrupted by user")
-    except Exception as e:
-        logger.error(f"Benchmark failed: {e}")
-        raise
+        logger.info("Enabled memory profiling.")
+        torch.cuda.memory._record_memory_history(max_entries=100000) # Start recording memory history
+        result = func(*args, **kwargs)
+        ## Output handling
+        output_dir = Path("memory_snapshots")
+        output_dir.mkdir(exist_ok=True)
+        snapshot_file = output_dir / \
+            f"model_{args[0].config}-dtype_{args[0].dtype}-mode_{args[0].mode}.pickle"
+        torch.cuda.memory._dump_snapshot(snapshot_file)
+        torch.cuda.memory._record_memory_history(enabled=None) # Stop recording history.
+        logger.info(f"Saved memory snapshot to {snapshot_file}")
+        return result
+    return wrapper
+
+def make_context(dtype):
+    dtype_map = {
+        'fp32': torch.float32,
+        'fp16': torch.float16,
+        'bf16': torch.bfloat16
+    }   
+    dtype = dtype_map[dtype]
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    context = nullcontext()
+    if dtype == torch.float32:
+        logger.info("Running with full precision (fp32).")
+    else:
+        context = torch.autocast(device_type=device, dtype=dtype)
+        logger.info(f"Running with mixed precision ({dtype}).")
+    return context
+
+def main():
+    args = parse_args()
+    setup_logging(log_level=args.log_level)
+
+    run = memory_profiling(benchmarking) if args.memory else benchmarking        
+    statistics = run(args)
+    logger.info(f"Running time:\n  {statistics}")
 
 if __name__ == "__main__":
     main()
+    
