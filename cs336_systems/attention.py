@@ -13,14 +13,33 @@ import torch.nn as nn
 from torch import Tensor
 import torch.cuda.nvtx as nvtx
 from jaxtyping import Float, Bool, Int
-
-
 from nn_utils import softmax
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("attention_impl")
 
-@nvtx.range("scaled dot product attention")
-def annotated_scaled_dot_product_attention(
+def copy_docstring(source_func):
+    def wrapper(target_func):
+        target_func.__doc__ = source_func.__doc__
+        return target_func
+    return wrapper
+
+
+def _make_attn_inputs(
+    device=None,
+    batch_size=8,
+    n_queries=128,
+    n_keys=128,
+    head_dim=64
+):
+    torch.random.manual_seed(0)
+    q = torch.randn(batch_size, n_queries, head_dim, device=device, requires_grad=True)
+    k = torch.randn(batch_size, n_keys, head_dim, device=device, requires_grad=True)
+    v = torch.randn(batch_size, n_keys, head_dim, device=device, requires_grad=True)
+    do = torch.randn(batch_size, n_queries, head_dim, device=device)
+
+    return q, k, v, do
+
+def scaled_dot_product_attention(
     Q: Float[Tensor, " ... queries d_k"],
     K: Float[Tensor, " ... keys    d_k"],
     V: Float[Tensor, " ... keys    d_v"],
@@ -44,6 +63,25 @@ def annotated_scaled_dot_product_attention(
         implementation with the provided key, query, and value tensors.
     """
 
+    d_k = K.shape[-1]
+    attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
+
+    if mask is not None:
+        attention_scores = torch.where(mask, attention_scores, float("-inf"))
+        
+    attention_weights = softmax(attention_scores, dim=-1)  # Softmax over the key dimension
+
+    outputs = einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
+    return outputs
+
+@copy_docstring(scaled_dot_product_attention)
+@nvtx.range("scaled dot product attention")
+def annotated_scaled_dot_product_attention(
+    Q: Float[Tensor, " ... queries d_k"],
+    K: Float[Tensor, " ... keys    d_k"],
+    V: Float[Tensor, " ... keys    d_v"],
+    mask: Bool[Tensor, " ... queries keys"] | None = None,
+) -> Float[Tensor, " ... queries d_v"]:
     d_k = K.shape[-1]
     with nvtx.range("computing attention scores (matmul)"):
         attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
