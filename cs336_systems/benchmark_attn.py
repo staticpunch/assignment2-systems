@@ -21,10 +21,9 @@ import torch.cuda.nvtx as nvtx
 from attention import (
     _make_attn_inputs,
     scaled_dot_product_attention,
-    scaled_dot_product_attention
 )
 
-logger = logging.getLogger("benchmarking")
+logger = logging.getLogger("benchmarking attention")
 
 def setup_logging(log_level: str = "INFO") -> logging.Logger:
     """Setup logging configuration."""
@@ -96,34 +95,53 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--num-warmups', type=int, default=10)
     parser.add_argument('--num-trials', type=int, default=100)
     parser.add_argument('--mode', type=str, choices=["forward", "grad"], default="forward")
-    parser.add_argument('--csv', type=str, default="results/naive_attention.csv")
+    parser.add_argument('--compile', action='store_true')
+    parser.add_argument('--memory', action='store_true')
+    parser.add_argument('--dtype', type=str, default='fp32',
+        choices=['fp32', 'fp16', 'bf16'])
+    parser.add_argument('--csv', type=str, default=None)
     
     return parser.parse_args()
 
 def benchmarking(args):
     logger.info(f"Benchmarking config: {vars(args)}")
+    attn_impl = scaled_dot_product_attention
+    if args.compile:
+        logger.info("Using torch-compiled kernels for attention.")
+        attn_impl = torch.compile(scaled_dot_product_attention)
+
+    dtype_map = {
+        'fp32': torch.float32,
+        'fp16': torch.float16,
+        'bf16': torch.bfloat16
+    }   
+    dtype = dtype_map[args.dtype]
+    logger.info(f"Precision: {dtype}")
+    
     device = get_device(args.gpu_index)
     Q, K, V, dO = _make_attn_inputs(
         device=device,
+        dtype=dtype,
         batch_size=8,
         n_queries=args.n_queries,
         n_keys=args.n_keys,
         head_dim=args.head_dim
     )
+    assert Q.dtype == K.dtype == V.dtype == dO.dtype == dtype
 
     def _forward():
         with nvtx.range("forward"):
-            outputs = scaled_dot_product_attention(Q, K, V, mask=None)
+            outputs = attn_impl(Q, K, V, mask=None)
 
     def _grad():
         with nvtx.range("forward"):
-            outputs = scaled_dot_product_attention(Q, K, V, mask=None)
+            outputs = attn_impl(Q, K, V, mask=None)
             loss = torch.sum((dO - outputs)**2)
         with nvtx.range("backward"):
             loss.backward()
 
-    MAPPER = {"forward": _forward, "grad": _grad}
-    run = MAPPER[args.mode]
+    RUN_MAPPER = {"forward": _forward, "grad": _grad}
+    run = RUN_MAPPER[args.mode]
     logger.info(f"Running {args.num_warmups} warmup iterations...")
     for _ in range(args.num_warmups):
         run()
@@ -154,11 +172,11 @@ def benchmarking(args):
 def main():
     args = parse_args()
     setup_logging()
-    run = memory_profiling(benchmarking)       
+    run = memory_profiling(benchmarking) if args.memory else benchmarking
     statistics = run(args)
     
-    # logger.info(f"Running time:\n  {statistics}")
-    if args.csv:
+    logger.info(f"Running time:\n  {statistics}")
+    if args.csv: # "results/naive_attention.csv"
         output_file = Path(args.csv)
         output_file.parent.mkdir(parents=True, exist_ok=True)
         content = (

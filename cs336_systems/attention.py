@@ -26,16 +26,17 @@ def copy_docstring(source_func):
 
 def _make_attn_inputs(
     device=None,
+    dtype=torch.float32,
     batch_size=8,
     n_queries=128,
     n_keys=128,
     head_dim=64
 ):
     torch.random.manual_seed(0)
-    q = torch.randn(batch_size, n_queries, head_dim, device=device, requires_grad=True)
-    k = torch.randn(batch_size, n_keys, head_dim, device=device, requires_grad=True)
-    v = torch.randn(batch_size, n_keys, head_dim, device=device, requires_grad=True)
-    do = torch.randn(batch_size, n_queries, head_dim, device=device)
+    q = torch.randn(batch_size, n_queries, head_dim, device=device, dtype=dtype, requires_grad=True)
+    k = torch.randn(batch_size, n_keys, head_dim, device=device, dtype=dtype, requires_grad=True)
+    v = torch.randn(batch_size, n_keys, head_dim, device=device, dtype=dtype, requires_grad=True)
+    do = torch.randn(batch_size, n_queries, head_dim, device=device, dtype=dtype)
 
     return q, k, v, do
 

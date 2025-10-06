@@ -1,11 +1,12 @@
 # Simple benchmarking with NSight
 python benchmark.py \
-	--config large \
-	--num-steps 20 \
-	--num-warmups 10 \
-	--batch-size 1 \
-	--sequence-length 128 \
+    --config large \
+    --num-steps 20 \
+    --num-warmups 10 \
+    --batch-size 1 \
+    --sequence-length 128 \
     --mode grad \
+    --compile \
     --memory \
     --dtype fp16 / bf16 / fp32
 
@@ -65,4 +66,7 @@ nsys profile -o results/attention python benchmark_attn.py \
     --n-queries 1024 \
     --n-keys 1024 \
     --head-dim 128 \
-    --mode grad
+    --mode grad \
+    --dtype fp32 \
+    --memory \
+    --compile

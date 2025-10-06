@@ -51,60 +51,22 @@ def std(x: list[float]) -> float:
 
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
-    parser = argparse.ArgumentParser(
-        description="Benchmark Transformer language models",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
+    parser = argparse.ArgumentParser()
     
-    parser.add_argument(
-        '--config', 
-        choices=list(CONFIGS.keys()),
-        default="small",
-        help='Model configurations to benchmark'
-    )
-    
-    parser.add_argument(
-        '--gpu-index', 
-        type=int, 
-        default=0,
-        help='GPU index to use (if available)'
-    )
-
-    parser.add_argument(
-        '--log-level', 
-        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], 
-        default='INFO',
-        help='Logging level'
-    )
-
-    parser.add_argument(
-        '--batch-size', 
-        type=int, 
-        default=1,
-        help='Batch size for benchmarking'
-    )
-
-    parser.add_argument(
-        '--num-warmups', 
-        type=int, 
-        default=10,
-        help='Number of warmup steps'
-    )
-    
-    parser.add_argument(
-        '--num-steps', 
-        type=int, 
-        default=20,
-        help='Number of steps in training loop'
-    )
-    
-    parser.add_argument(
-        '--sequence-length', 
-        type=int, 
-        default=128,
-        help='Sequence length for benchmarking'
-    )
-
+    parser.add_argument('--config', type=str,
+        choices=list(CONFIGS.keys()), default="small")
+    parser.add_argument('--gpu-index', type=int, default=0)
+    parser.add_argument('--log-level', type=str,
+        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], default='INFO')
+    parser.add_argument('--batch-size', type=int, default=1)
+    parser.add_argument('--num-warmups', type=int, default=10)
+    parser.add_argument('--num-steps', type=int, default=20)
+    parser.add_argument('--sequence-length', type=int, default=128)
+    parser.add_argument('--dtype', type=str, default='fp32', 
+        choices=['fp32', 'fp16', 'bf16'])
+    parser.add_argument('--memory', action='store_true')
+    parser.add_argument('--compile', action='store_true',
+        help="Compile model using torch.compile()")
     parser.add_argument(
         '--mode', 
         choices=['forward', 'grad', 'train'], 
@@ -114,20 +76,6 @@ def parse_args() -> argparse.Namespace:
             "  `grad`: Running forward and backward passes.\n"
             "  `train`: Running full training steps."
         )
-    )
-
-    parser.add_argument(
-        '--dtype', 
-        type=str,
-        default='fp32',
-        choices=['fp32', 'fp16', 'bf16'],
-        help='Data type for training: fp32, fp16, or bf16'
-    )
-
-    parser.add_argument(
-        '--memory', 
-        action='store_true',
-        help='Profiling memory usage.'
     )
 
     return parser.parse_args()
@@ -142,6 +90,9 @@ def benchmarking(args):
     
 
     model = nn.BasicsTransformerLM(**cfg).to(device)
+    if args.compile:
+        logger.info("Compiling model with `torch.compile()`")
+        model = torch.compile(model)
     num_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model {args.config} loaded with {num_params:,} parameters")
     
