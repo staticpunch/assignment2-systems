@@ -1,6 +1,4 @@
 # Simple benchmarking with NSight
-nsys profile -o nsys_results/small python benchmark.py --configs small --num-warmups 5 --end-to-end --log-level INFO
-
 python benchmark.py \
 	--config large \
 	--num-steps 20 \
@@ -14,25 +12,23 @@ python benchmark.py \
 
 # Annotated profiling with NSight. Following scripts are quite comprehensive,
 # as they annotate forward, backward, optimizer step and also the attention operation.
-nsys profile -o nsys_results/gpt_large_train --force-overwrite true \
-python nsys_profile.py \
-	--config large \
-	--num-steps 20 \
-	--num-warmups 10 \
-	--batch-size 1 \
-	--sequence-length 128 \
-    --annotate_attention \
-	--mode train
+MODES=(forward grad train)
+CONFIGS=(small medium large)
 
-nsys profile -o nsys_results/gpt_large_grad --force-overwrite true \
-python nsys_profile.py \
-	--config large \
-	--num-steps 20 \
-	--num-warmups 10 \
-	--batch-size 1 \
-	--sequence-length 128 \
-    --annotate_attention \
-	--mode grad
+for mode in "${MODES[@]}"; do
+    for config in "${CONFIGS[@]}"; do
+        echo "Running: model_config=$config, mode=$mode"
+        nsys profile -o "results/nsys/gpt_${config}_${mode}" --force-overwrite true \
+        python nsys_profile.py \
+            --config "$config" \
+            --num-steps 20 \
+            --num-warmups 10 \
+            --batch-size 1 \
+            --sequence-length 128 \
+            --annotate_attention \
+            --mode "$mode"
+    done
+done
 
 nsys profile -o nsys_results/gpt_large_forward --force-overwrite true \
 python nsys_profile.py \
@@ -50,7 +46,7 @@ HEAD_DIMS=(16 32 64 128)
 SEQ_LENGTHS=(256 1024 4096 8192 16384)
 CSV_FILE="results/naive_attention.csv"
 
-rm -f "$CSV_FILE"
+rm  "$CSV_FILE"
 echo "head_dim,seq_length,mean_ms,std_ms,min_ms,max_ms" > "$CSV_FILE"
 
 for head_dim in "${HEAD_DIMS[@]}"; do
@@ -64,4 +60,9 @@ for head_dim in "${HEAD_DIMS[@]}"; do
     done
 done
 
-echo "Results saved to $CSV_FILE"
+# Profiling attention implementations
+nsys profile -o results/attention python benchmark_attn.py \
+    --n-queries 1024 \
+    --n-keys 1024 \
+    --head-dim 128 \
+    --mode grad

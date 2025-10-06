@@ -26,7 +26,7 @@ from attention import (
 
 logger = logging.getLogger("benchmarking")
 
-def setup_logging(log_level: str = "WARNING") -> logging.Logger:
+def setup_logging(log_level: str = "INFO") -> logging.Logger:
     """Setup logging configuration."""
     logger.setLevel(getattr(logging, log_level.upper()))
     logger.handlers.clear()
@@ -67,16 +67,18 @@ def memory_profiling(func):
             
         logger.info("Enabled memory profiling.")
         torch.cuda.memory._record_memory_history(max_entries=100000) # Start recording memory history
-        result = func(*args, **kwargs)
-        ## Output handling
-        output_dir = Path("memory_snapshots")
-        output_dir.mkdir(exist_ok=True)
-        snapshot_file = output_dir / \
-            f"naive_attention-{args[0].n_queries}-{args[0].head_dim}.pickle"
-        torch.cuda.memory._dump_snapshot(snapshot_file)
-        torch.cuda.memory._record_memory_history(enabled=None) # Stop recording history.
-        logger.info(f"Saved memory snapshot to {snapshot_file}")
-        return result
+        try:
+            result = func(*args, **kwargs)
+            return result
+        finally:
+            ## Output handling, OOM handling.
+            output_dir = Path("memory_snapshots")
+            output_dir.mkdir(exist_ok=True)
+            snapshot_file = output_dir / \
+                f"naive_attention-{args[0].n_queries}-{args[0].head_dim}.pickle"
+            torch.cuda.memory._dump_snapshot(snapshot_file)
+            torch.cuda.memory._record_memory_history(enabled=None) # Stop recording history.
+            logger.info(f"Saved memory snapshot to {snapshot_file}")
     return wrapper
 
 def parse_args() -> argparse.Namespace:
@@ -93,6 +95,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--head-dim', type=int, default=64)
     parser.add_argument('--num-warmups', type=int, default=10)
     parser.add_argument('--num-trials', type=int, default=100)
+    parser.add_argument('--mode', type=str, choices=["forward", "grad"], default="forward")
     parser.add_argument('--csv', type=str, default="results/naive_attention.csv")
     
     return parser.parse_args()
@@ -109,9 +112,18 @@ def benchmarking(args):
     )
 
     def _forward():
-        outputs = scaled_dot_product_attention(Q, K, V, mask=None)
+        with nvtx.range("forward"):
+            outputs = scaled_dot_product_attention(Q, K, V, mask=None)
 
-    run = _forward
+    def _grad():
+        with nvtx.range("forward"):
+            outputs = scaled_dot_product_attention(Q, K, V, mask=None)
+            loss = torch.sum((dO - outputs)**2)
+        with nvtx.range("backward"):
+            loss.backward()
+
+    MAPPER = {"forward": _forward, "grad": _grad}
+    run = MAPPER[args.mode]
     logger.info(f"Running {args.num_warmups} warmup iterations...")
     for _ in range(args.num_warmups):
         run()
@@ -121,12 +133,14 @@ def benchmarking(args):
     logger.info(f"Running {args.num_trials} benchmark iterations...")
     times = []
     for trial in range(args.num_trials):
+        nvtx.range_push(f"step_{trial}")
         start_time = timeit.default_timer()
         run()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         end_time = timeit.default_timer()
         times.append((end_time - start_time) * 1000)
+        nvtx.range_pop()
 
     statistics = dict(
         mean=mean(times),
