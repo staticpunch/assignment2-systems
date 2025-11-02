@@ -189,12 +189,14 @@ class FlashAttentionPytorch(torch.autograd.Function):
 
         - m_i^(j) ∈ R^(B_q): Running maximum across key tiles
             * Tracks the maximum value seen so far for numerical stability
-            * Updated as: m_i^(j) = max(m_i^(j-1), rowmax(S_ij))
+            * Definition: m_i^{j} = rowmax(Si[:jth-tile])
+            * Recursive formula: m_i^(j) = max(m_i^(j-1), rowmax(S_ij))
             * Used to compute numerically stable softmax
 
         - l_i^(j) ∈ R^(B_q): Running proxy for softmax denominator
             * Accumulates unnormalized softmax values
-            * Updated as: l_i^(j) = exp(m_i^(j-1) - m_i^(j)) * l_i^(j-1) + rowsum(exp(S_ij - m_i^(j)))
+            * Definition: l_i^{j} = sum(exp(Si[:jth-tile] - rowmax(Si[:jth-tile])))
+            * Recursive formula: l_i^(j) = exp(m_i^(j-1) - m_i^(j)) * l_i^(j-1) + rowsum(exp(S_ij - m_i^(j)))
             * Used for easier backward recomputation
 
         - P̃_i^(j) = exp(S_ij - m_i^(j)): Unnormalized softmax numerators
