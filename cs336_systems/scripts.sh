@@ -91,3 +91,6 @@ nsys profile -o results/attention python benchmark_attn.py \
     --dtype fp32 \
     --memory \
     --compile
+
+# Testing attention implementaion
+uv run pytest tests/test_attention.py -k test_flash_forward_pass_pytorch

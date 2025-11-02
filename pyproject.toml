@@ -19,6 +19,7 @@ dependencies = [
     "ty>=0.0.1a16",
     "jupyter>=1.1.1",
     "lab>=8.5",
+    "lovely-tensors>=0.1.19",
 ]
 
 [build-system]

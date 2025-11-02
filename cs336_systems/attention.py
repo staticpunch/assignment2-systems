@@ -13,7 +13,7 @@ import torch.nn as nn
 from torch import Tensor
 import torch.cuda.nvtx as nvtx
 from jaxtyping import Float, Bool, Int
-from nn_utils import softmax
+from .nn_utils import softmax
 
 logger = logging.getLogger("attention_impl")
 
