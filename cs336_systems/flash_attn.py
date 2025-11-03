@@ -13,165 +13,107 @@ import torch.nn as nn
 from torch import Tensor
 import torch.cuda.nvtx as nvtx
 from jaxtyping import Float, Bool, Int
-# from nn_utils import softmax
-from .attention import (
-    scaled_dot_product_attention,
-    annotated_scaled_dot_product_attention
-)
+from .nn_utils import softmax
+import triton
+import triton.language as tl
 
 import lovely_tensors as lt
 lt.monkey_patch()
 
 logger = logging.getLogger("flash_attn")
+def setup_logging(log_level: str = "INFO") -> logging.Logger:
+    logger.setLevel(getattr(logging, log_level.upper()))
+    logger.handlers.clear()
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    
+    return logger
+setup_logging()
 
 FLASH_ATTENTION_DOCSTRING = """
+TODO: Make this docstring comprehensive and more clear.
+
 FlashAttention-2 forward pass with tiled computation and online softmax.
 
-This implementation computes attention output O = softmax(QK^T)V using tiling
-to avoid materializing the full attention matrix S = QK^T in HBM. Each tile
-of the output P is computed independently, enabling memory-efficient attention.
+Overview:
+This implementation computes the attention output O = softmax(QK^T)V using tiling
+to avoid materializing the full attention matrix S = QK^T in high-bandwidth memory 
+(HBM). Each tile of the output is computed independently, enabling memory-efficient 
+attention computation.
 
-Algorithm Overview:
--------------------
-To avoid reading and writing the attention matrix to/from HBM, we use tiling
-to compute each tile of the output independently. This requires computing tiles
-of P that are ideally tiled in both dimensions (for queries and keys).
+To avoid reading and writing the attention matrix to/from HBM, we use tiling to 
+compute each tile of the output independently. This requires computing tiles of the 
+attention probabilities P that are tiled in both dimensions (queries and keys). 
+Since softmax(S) requires entire rows of S to compute the denominator, we cannot 
+compute P in tiles directly. FlashAttention-2 solves this using online softmax, 
+which incrementally computes softmax statistics as we process each key tile.
 
-Online Softmax:
----------------
-Since softmax(S) requires entire rows of S to compute the denominator, we cannot
-compute P in tiles directly. FlashAttention-2 solves this using online softmax,
-which incrementally computes softmax statistics as we process key tiles.
+This algorithm achieves O(1) memory complexity with respect to sequence length by 
+never materializing the full attention matrix in HBM. Only tiles that fit in SRAM 
+are processed at any given time.
 
 Notation:
----------
-- i: subscript index denoting the current query tile
-- j: superscript index denoting the current key tile
-- B_q: tile size along the query dimension
-- B_k: tile size along the key dimension
-- d: hidden dimension (not tiled)
+    - i: Query tile index (subscript)
+    - j: Key tile index (superscript)
+    - B_q: Tile size along the query dimension
+    - B_k: Tile size along the key dimension
+    - d: Hidden dimension (not tiled)
+    - S_i^{j}: Attention logit scores for query tile i and key tile j, 
+               computed as Q_i @ K_j^T
+    - T_k: Total number of key tiles
 
-Running Values (per query tile):
---------------------------------
-For each query tile i, we maintain row-wise running statistics:
+Running Statistics:
+For each query tile i, we maintain row-wise running statistics across key tiles:
 
-- m_i^(j) ∈ R^(B_q): Running maximum across key tiles
-    * Tracks the maximum value seen so far for numerical stability
-    * Updated as: m_i^(j) = max(m_i^(j-1), rowmax(S_ij))
-    * Used to compute numerically stable softmax
+    m_i^{j} ∈ R^{B_q}: Running maximum across key tiles
+        Definition: Maximum value seen so far across all processed key tiles, used for 
+            numerically stable softmax computation by offsetting exponentials.
+        * Full formula: m_i^{j} = rowmax(S_i^{≤j})
+        * Recursive formula: m_i^{j} = max(m_i^{j-1}, rowmax(S_i^{j}))
 
-- l_i^(j) ∈ R^(B_q): Running proxy for softmax denominator
-    * Accumulates unnormalized softmax values
-    * Updated as: l_i^(j) = exp(m_i^(j-1) - m_i^(j)) * l_i^(j-1) + rowsum(exp(S_ij - m_i^(j)))
+    l_i^{j} ∈ R^{B_q}: Running sum of exponentials
+        Definition: Accumulator for the softmax denominator, representing the sum of 
+            exponentials of attention logit scores offset by the running maximum m_i^{j}.
+        * Full formula: l_i^{j} = sum(exp(S_i^{≤j} - rowmax(S_i^{≤j})))
+        * Recursive formula: 
+            l_i^{j} = exp(m_i^{j-1} - m_i^{j}) * l_i^{j-1}     (rescaled previous sum)
+                      + rowsum(exp(S_i^{j} - m_i^{j}))         (contribution from new tile)
 
-- P̃_i^(j) = exp(S_ij - m_i^(j)): Unnormalized softmax numerators
-    * Computed for the current tile using the running maximum
+    Õ_i^{j} ∈ R^{B_q × d}: Unnormalized accumulated output
+        Definition: Running sum of weighted values, not yet normalized by the final 
+            softmax denominator.
 
 Final Output:
--------------
-After processing all T_k key tiles, normalize the output using the final
-running denominator l_i^(T_k) to obtain the complete attention output.
+After processing all T_k key tiles, the final attention output is obtained by 
+normalizing the accumulated output Õ_i^{T_k} using the final running sum l_i^{T_k}:
+    O_i = diag(l_i^{T_k})^{-1} Õ_i^{T_k}
 
-Notes:
-------
-This algorithm enables O(1) memory complexity with respect to sequence length
-by never materializing the full attention matrix in HBM, only processing tiles
-that fit in SRAM.   
+Example: Two-Tile Computation
+For a simple case with 2 key/value tiles (j=1, 2), the online softmax algorithm 
+proceeds as follows:
+
+First iteration (j=1):
+    m_i^{1} = rowmax(S_i^{1}) ∈ R^{B_q}
+    l_i^{1} = rowsum(exp(S_i^{1} - m_i^{1})) ∈ R^{B_q}
+    Õ_i^{1} = exp(S_i^{1} - m_i^{1}) V^{1} ∈ R^{B_q × d}
+
+Second iteration (j=2):
+    m_i^{2} = max(m_i^{1}, rowmax(S_i^{2})) = m_i
+    l_i^{2} = exp(m_i^{1} - m_i^{2}) * l_i^{1} + rowsum(exp(S_i^{2} - m_i^{2}))
+            = rowsum(exp(S_i^{1} - m_i)) + rowsum(exp(S_i^{2} - m_i)) = l_i
+    
+    Õ_i^{2} = diag(exp(m_i^{1} - m_i^{2})) * Õ_i^{1} + exp(S_i^{2} - m_i^{2}) V^{2}
+            = exp(S_i^{1} - m_i) V^{1} + exp(S_i^{2} - m_i) V^{2}
+    
+    O_i = diag(l_i^{2})^{-1} Õ_i^{2}
+
+The final normalization step produces the correct attention output equivalent to 
+computing softmax over all key tiles at once.
 """
-
-EXAMPLE_DOCSTRING = """
-Concrete Example: Two-Block Computation
-----------------------------------------
-For the simple case of 2 key/value tiles (j=1,2), the computation with online 
-softmax algorithm proceeds as follows:
-
-**First Iteration (j=1):**
-
-    m^(1) = rowmax(S^(1)) ∈ ℝ^(B_r)
-        Initialize running maximum from first attention score tile
-    
-    ℓ^(1) = rowsum(exp(S^(1) - m^(1))) ∈ ℝ^(B_r)
-        Initialize running softmax denominator (unnormalized)
-    
-    Õ^(1) = exp(S^(1) - m^(1)) V^(1) ∈ ℝ^(B_r × d)
-        Compute initial weighted output (unnormalized)
-
-**Second Iteration (j=2):**
-
-    m^(2) = max(m^(1), rowmax(S^(2))) = m
-        Update running maximum across both tiles (becomes final m)
-    
-    ℓ^(2) = exp(m^(1) - m^(2)) ℓ^(1) + rowsum(exp(S^(2) - m^(2)))
-            = rowsum(exp(S^(1) - m)) + rowsum(exp(S^(2) - m)) = ℓ
-        Rescale previous denominator and add current tile's contribution
-        (becomes final ℓ after all tiles processed)
-    
-    P̃^(2) = diag(ℓ^(2))^(-1) exp(S^(2) - m^(2))
-        Normalized attention weights for second tile only
-    
-    Õ^(2) = diag(exp(m^(1) - m^(2)))^(-1) Õ^(1) + exp(S^(2) - m^(2)) V^(2)
-            = exp(S^(1) - m) V^(1) + exp(S^(2) - m) V^(2)
-        Rescale previous output and add current tile's contribution
-        (accumulated unnormalized output)
-    
-    O^(2) = diag(ℓ^(2))^(-1) Õ^(2) = O
-        Final normalization produces correct attention output
-
-Key Insights:
--------------
-- m: Final running maximum used for numerical stability
-- ℓ: Final softmax denominator = sum of exp(S_ij - m) over all tiles
-- Õ: Accumulated weighted sum that gets rescaled as m updates
-- O: Final normalized output = Õ / ℓ
-
-The rescaling factors (exp(m^(j-1) - m^(j))) ensure correctness when
-the running maximum changes, allowing us to process tiles sequentially
-without materializing the full attention matrix.
-
-Dimensions:
------------
-- B_r: Number of rows in query tile (block size)
-- d: Hidden dimension
-- S^(j): Attention scores for tile j, shape (B_r, B_c)
-- V^(j): Value vectors for tile j, shape (B_c, d)
-- m, ℓ: Row-wise statistics, shape (B_r,)
-- O, Õ: Output matrices, shape (B_r, d)
-"""
-def softmax(x, dim=-1):
-    rescaled_input = x - torch.max(x, dim=dim, keepdim=True)[0]
-    exponentiated_rescaled_input = torch.exp(rescaled_input)
-    return exponentiated_rescaled_input / torch.sum(exponentiated_rescaled_input, dim=dim, keepdim=True)
-
-def attention_debug(
-    Q: Float[Tensor, " ... queries d_k"],
-    K: Float[Tensor, " ... keys    d_k"],
-    V: Float[Tensor, " ... keys    d_v"],
-    is_causal: Bool = False,
-):
-    n_queries = Q.shape[-2]
-    n_keys = K.shape[-2]
-    d = Q.shape[-1]
-    scale = 1 / (d ** 0.5)
-
-    # Equation 4
-    S = einsum(Q, K, '... q d, ... k d -> ... q k') * scale
-    if is_causal:
-        S = torch.where(
-            torch.arange(n_queries, device=S.device)[None, :, None] >= 
-            torch.arange(n_keys, device=S.device)[None, None, :],
-            S, -1e6
-        )
-
-    # Equation 5
-    P = softmax(S, dim=-1)
-
-    # Equation 6
-    O = einsum(P, V, '... q k, ... k d -> ... q d')
-
-    # Equation 12
-    L = torch.logsumexp(S, dim=-1)
-    return (S, L, O, P)
-
 
 class FlashAttentionPytorch(torch.autograd.Function):
     @staticmethod
@@ -180,53 +122,29 @@ class FlashAttentionPytorch(torch.autograd.Function):
         Q: Float[Tensor, " ... queries d_k"],
         K: Float[Tensor, " ... keys    d_k"],
         V: Float[Tensor, " ... keys    d_v"],
-        is_causal: Bool | None = False,
+        is_causal: Bool = False,
+        return_attn_probs: Bool = False,
     ):
-        """
-        Running Values (per query tile):
-        --------------------------------
-        For each query tile i, we maintain row-wise running statistics:
-
-        - m_i^(j) ∈ R^(B_q): Running maximum across key tiles
-            * Tracks the maximum value seen so far for numerical stability
-            * Definition: m_i^{j} = rowmax(Si[:jth-tile])
-            * Recursive formula: m_i^(j) = max(m_i^(j-1), rowmax(S_ij))
-            * Used to compute numerically stable softmax
-
-        - l_i^(j) ∈ R^(B_q): Running proxy for softmax denominator
-            * Accumulates unnormalized softmax values
-            * Definition: l_i^{j} = sum(exp(Si[:jth-tile] - rowmax(Si[:jth-tile])))
-            * Recursive formula: l_i^(j) = exp(m_i^(j-1) - m_i^(j)) * l_i^(j-1) + rowsum(exp(S_ij - m_i^(j)))
-            * Used for easier backward recomputation
-
-        - P̃_i^(j) = exp(S_ij - m_i^(j)): Unnormalized softmax numerators
-            * Computed for the current tile using the running maximum
-
-        Final Output:
-        -------------
-        After processing all T_k key tiles, normalize the output using the final
-        running denominator l_i^(T_k) to obtain the complete attention output.
-        """
-        debug = True
+        logger.info("Running Flash Attention 2 Pytorch")
         n_queries = Q.shape[-2]
         n_keys = K.shape[-2]
         d = Q.shape[-1]
         scale = 1 / (d ** 0.5)
-        Bq, Bk = 16, 32
-        Tq, Tk = math.ceil(n_queries / Bq), math.ceil(n_keys / Bk)
+        Q_TILE_SIZE, K_TILE_SIZE = 16, 32
+        Tq, Tk = math.ceil(n_queries / Q_TILE_SIZE), math.ceil(n_keys / K_TILE_SIZE)
 
         # Reshaping Q, K, V so that each outer for-loop iteration 
         # deals with elements from a single batch index
         original_shape = Q.shape
-        Q = rearrange(Q, "... queries d -> (...) queries d")  # (n_programs, n_queries, d)
-        K = rearrange(K, "... keys d -> (...) keys d")        # (n_programs, n_keys, d)
-        V = rearrange(V, "... keys d -> (...) keys d")        # (n_programs, n_keys, d)
-        O = torch.zeros(Q.shape)                              # (n_programs, n_queries, d)
-        L = torch.zeros(Q.shape[:-1])                         # (n_programs, n_queries)
+        Q = rearrange(Q, "... queries d -> (...) queries d")             # (n_programs, n_queries, d)
+        K = rearrange(K, "... keys d -> (...) keys d")                   # (n_programs, n_keys, d)
+        V = rearrange(V, "... keys d -> (...) keys d")                   # (n_programs, n_keys, d)
+        O = torch.zeros(Q.shape, device=Q.device, dtype=Q.dtype)         # (n_programs, n_queries, d)
+        L = torch.zeros(Q.shape[:-1], device=Q.device, dtype=Q.dtype)    # (n_programs, n_queries)
         n_programs = Q.shape[0]
 
-        if debug:
-            S_debug = torch.zeros(n_programs, n_queries, n_keys)  # (n_programs, n_queries, n_keys)
+        if return_attn_probs:                                            # (n_programs, n_queries, n_keys)
+            S = torch.zeros((n_programs, n_queries, n_keys),  device=Q.device, dtype=Q.dtype)               
 
         for pid in range(n_programs):
             # Extract tensors for current batch element
@@ -234,63 +152,64 @@ class FlashAttentionPytorch(torch.autograd.Function):
             
             for i in range(Tq):
                 # Load query tile
-                Qi = q[i*Bq:(i+1)*Bq, :]                    # (Bq, d)
-                Oi = o[i*Bq:(i+1)*Bq, :]                    # (Bq, d)
-                li = l[i*Bq:(i+1)*Bq]                       # (Bq,)
-                mi = torch.full((Bq,), -torch.inf)          # (Bq,) - initialized to -inf
-
+                Qi = q[i*Q_TILE_SIZE:(i+1)*Q_TILE_SIZE, :]               # (Q_TILE_SIZE, d)
+                Oi = o[i*Q_TILE_SIZE:(i+1)*Q_TILE_SIZE, :]               # (Q_TILE_SIZE, d)
+                li = l[i*Q_TILE_SIZE:(i+1)*Q_TILE_SIZE]                  # (Q_TILE_SIZE,)
+                mi = torch.full((Q_TILE_SIZE,), -torch.inf, device=Q.device, dtype=Q.dtype)
+                                                                         # (Q_TILE_SIZE,) - initialized to -inf
                 for j in range(Tk):
                     # Load key and value tiles
-                    Kj = k[j*Bk:(j+1)*Bk, :]                # (Bk, d)
-                    Vj = v[j*Bk:(j+1)*Bk, :]                # (Bk, d)
+                    Kj = k[j*K_TILE_SIZE:(j+1)*K_TILE_SIZE, :]           # (K_TILE_SIZE, d)
+                    Vj = v[j*K_TILE_SIZE:(j+1)*K_TILE_SIZE, :]           # (K_TILE_SIZE, d)
 
                     # Step 1: Compute tile of pre-softmax attention scores
-                    # Sij = (Bq, Bk) <- Qi @ Kj.T = (Bq, d) @ (d, Bk)
+                    # Sij: (Q_TILE_SIZE, K_TILE_SIZE) <- Qi @ Kj.T: (Q_TILE_SIZE, d) @ (d, K_TILE_SIZE)
                     Sij = (Qi @ Kj.T) * scale
-                    if debug: 
-                        S_debug[pid, i*Bq:(i+1)*Bq, j*Bk:(j+1)*Bk] = Sij
+                    if return_attn_probs: 
+                        S[pid, i*Q_TILE_SIZE:(i+1)*Q_TILE_SIZE, j*K_TILE_SIZE:(j+1)*K_TILE_SIZE] = Sij
 
                     # Step 2: Update running maximum
-                    # mi_next = (Bq,) <- max(mi, rowmax(Sij))
+                    # mi_next (fp32): (Q_TILE_SIZE,) <- mi (fp32): (Q_TILE_SIZE,), Sij: (Q_TILE_SIZE, K_TILE_SIZE)
                     mi_next = torch.max(mi, Sij.max(dim=-1).values)
 
                     # Step 3: Compute unnormalized softmax numerator
-                    # Pij = (Bq, Bk) <- exp(Sij - mi_next[:, None])
+                    # Pij (fp32): (Q_TILE_SIZE, K_TILE_SIZE) <- Sij: (Q_TILE_SIZE, K_TILE_SIZE), mi_next (fp32): (Q_TILE_SIZE,)
                     Pij = torch.exp(Sij - mi_next[:, None])
                     
                     # Step 4: Update running denominator proxy
-                    # li_next = (Bq,) <- exp(mi - mi_next) * li + rowsum(Pij)
+                    # li_next (fp32): (Q_TILE_SIZE,) <- mi, mi_next, li: (Q_TILE_SIZE,)
                     li_next = torch.exp(mi - mi_next) * li + Pij.sum(dim=-1)
         
                     # Step 5: Update output accumulator
-                    # Oi_next = (Bq, d) <- exp(mi - mi_next)[:, None] * Oi + Pij @ Vj
+                    # Oi_next: (Q_TILE_SIZE, d) <- mi, mi_next: (Q_TILE_SIZE,), Oi: (Q_TILE_SIZE, d)
+                    #                           <- Pij: (Q_TILE_SIZE, K_TILE_SIZE), Vj: (K_TILE_SIZE, d)
                     Oi_next = torch.exp(mi - mi_next)[:, None] * Oi + Pij @ Vj
                     
                     # Step 6: Update running values
                     mi, li, Oi = mi_next, li_next, Oi_next
 
                 # Normalize output by final denominator
-                # Oi = (Bq, d) <- Oi / li[:, None]
+                # Oi = (Q_TILE_SIZE, d) <- Oi / li[:, None]
                 Oi = Oi / li[:, None]
                 
                 # Compute logsumexp for backward pass
-                # Li = (Bq,) <- mi + log(li)
+                # Li = (Q_TILE_SIZE,) <- mi + log(li)
                 Li = mi + torch.log(li)
 
                 # Write tile results back
-                o[i*Bq:(i+1)*Bq, :] = Oi
-                l[i*Bq:(i+1)*Bq] = Li
+                o[i*Q_TILE_SIZE:(i+1)*Q_TILE_SIZE, :] = Oi
+                l[i*Q_TILE_SIZE:(i+1)*Q_TILE_SIZE] = Li
 
             # Write batch results back
-            L[pid] = l
-            O[pid] = o
+            L[pid], O[pid] = l, o
         
         # Reshape outputs to original shape
         L = L.view(original_shape[:-1])  # (..., n_queries)
         O = O.view(original_shape)       # (..., n_queries, d)
 
-        result = (S_debug, L, O) if debug else O
-        return result
+        outputs = (S, O) if return_attn_probs else O
+        ctx.save_for_backward(L, Q, K, V, O)
+        return outputs
 
     @staticmethod
     def backward(ctx, grad_out):
@@ -303,7 +222,8 @@ class AttentionPytorch(torch.autograd.Function):
         Q: Float[Tensor, " ... queries d_k"],
         K: Float[Tensor, " ... keys    d_k"],
         V: Float[Tensor, " ... keys    d_v"],
-        is_causal: Bool | None = None,
+        is_causal: Bool = False,
+        return_attn_probs: Bool = False
     ):
         n_queries = Q.shape[-2]
         n_keys = K.shape[-2]
@@ -320,7 +240,7 @@ class AttentionPytorch(torch.autograd.Function):
             )
 
         # Equation 5
-        P = torch.softmax(S, dim=-1)
+        P = softmax(S, dim=-1)
 
         # Equation 6
         O = einsum(P, V, '... q k, ... k d -> ... q d')
@@ -328,59 +248,203 @@ class AttentionPytorch(torch.autograd.Function):
         # Equation 12
         L = torch.logsumexp(S, dim=-1)
         ctx.save_for_backward(L, Q, K, V, O)
+
+        outputs = (S, O) if return_attn_probs else O
+        return outputs
+        
+    @staticmethod
+    def backward(ctx, grad_out):
+        raise NotImplementedError
+
+class FlashAttentionTriton(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        Q: Float[Tensor, " ... queries d_k"],
+        K: Float[Tensor, " ... keys    d_k"],
+        V: Float[Tensor, " ... keys    d_v"],
+        is_causal: Bool = False,
+    ):
+        """
+        NOTES:
+        Launch grid:
+            Launch grid should be set as (T_q, batch_size), meaning each Triton program 
+            instance will load only elements from a single batch index, and only read/write 
+            to a single query tile of Q, O, and L.
+
+        Kernel structure:
+            The kernel should only have a single loop, which will iterate key tiles 1 ≤ j ≤ T_k.
+        
+        On-chip buffers:
+            The on-chip buffers (O_i, l, m) should have dtype tl.float32. If you're 
+            accumulating into an output buffer, use the acc argument 
+            (acc = tl.dot(..., acc=acc)).
+
+        Type casting:
+            Cast P̃^(j) to the dtype of V^(j) before multiplying them, and cast O_i to 
+            the appropriate dtype before writing it to global memory. Casting is done 
+            with tensor.to. You can get the dtype of a tensor with tensor.dtype, and 
+            the dtype of a block pointer/pointer with *_block_ptr.type.element_ty.
+        """
+        logger.info("Running Flash Attention 2 Triton")
+
+        n_queries = Q.shape[-2]
+        n_keys = K.shape[-2]
+        d = Q.shape[-1]
+        scale = 1 / (d ** 0.5)
+        Q_TILE_SIZE, K_TILE_SIZE = 16, 32
+        
+        # Reshaping Q, K, V so that each outer for-loop iteration 
+        # deals with elements from a single batch index
+        original_shape = Q.shape
+        Q = rearrange(Q, "... queries d -> (...) queries d")             # (n_programs, n_queries, d)
+        K = rearrange(K, "... keys d -> (...) keys d")                   # (n_programs, n_keys, d)
+        V = rearrange(V, "... keys d -> (...) keys d")                   # (n_programs, n_keys, d)
+        O = torch.zeros(Q.shape, device=Q.device, dtype=Q.dtype)         # (n_programs, n_queries, d)
+        L = torch.zeros(Q.shape[:-1], device=Q.device, dtype=Q.dtype)    # (n_programs, n_queries)
+        batch_size = Q.shape[0]
+
+        N_QUERY_TILES = triton.cdiv(n_queries, Q_TILE_SIZE)
+
+        grid = (N_QUERY_TILES, batch_size)
+        flash_fwd_kernel[grid](
+            Q_ptr=Q, K_ptr=K, V_ptr=V,
+            O_ptr=O, L_ptr=L,
+            stride_qb=Q.stride(0), stride_qq=Q.stride(1), stride_qd=Q.stride(2),
+            stride_kb=K.stride(0), stride_kk=K.stride(1), stride_kd=K.stride(2),
+            stride_vb=V.stride(0), stride_vk=V.stride(1), stride_vd=V.stride(2),
+            stride_ob=O.stride(0), stride_oq=O.stride(1), stride_od=O.stride(2),
+            stride_lb=L.stride(0), stride_lq=L.stride(1),
+            N_QUERIES=n_queries, N_KEYS=n_keys,
+            scale=scale,
+            D=d,
+            Q_TILE_SIZE=Q_TILE_SIZE,
+            K_TILE_SIZE=K_TILE_SIZE
+        )
+
+        # Reshape outputs to original shape
+        L = L.view(original_shape[:-1])  # (..., n_queries)
+        O = O.view(original_shape)       # (..., n_queries, d)
+
+        ctx.save_for_backward(L, Q, K, V, O)
         return O
         
     @staticmethod
     def backward(ctx, grad_out):
         raise NotImplementedError
 
-def flash_attention_forward_pytorch(
-    Q: Float[Tensor, " ... queries d_k"],
-    K: Float[Tensor, " ... keys    d_k"],
-    V: Float[Tensor, " ... keys    d_v"],
-    is_causal: Bool | None = None,
+@triton.jit
+def flash_fwd_kernel(
+    Q_ptr, K_ptr, V_ptr,
+    O_ptr, L_ptr,
+    stride_qb, stride_qq, stride_qd,
+    stride_kb, stride_kk, stride_kd,
+    stride_vb, stride_vk, stride_vd,
+    stride_ob, stride_oq, stride_od,
+    stride_lb, stride_lq,
+    N_QUERIES, N_KEYS,
+    scale,
+    D: tl.constexpr,
+    Q_TILE_SIZE: tl.constexpr,
+    K_TILE_SIZE: tl.constexpr
 ):
-    """
-    Implements the FlashAttention-2 forward pass as a pure PyTorch autograd.Function.
+    # Program indices
+    query_tile_idx = tl.program_id(0)
+    batch_index = tl.program_id(1)
 
-    This implementation does not use Triton and is intended to be a slower,
-    more debuggable reference for a Triton kernel implementation. It computes the
-    attention output `O` and the log-sum-exp `L` value using a tiled approach.
+    # Offset each pointer with the corresponding batch index
+    # multiplied with the batch stride for each tensor
+    Q_block_ptr = tl.make_block_ptr(
+        Q_ptr + batch_index * stride_qb,           # select the k-th batch index
+        shape=(N_QUERIES, D),
+        strides=(stride_qq, stride_qd),
+        offsets=(query_tile_idx * Q_TILE_SIZE, 0), # select the i-th tile index
+        block_shape=(Q_TILE_SIZE, D),
+        order=(1,0)
+    )
 
-    Args:
-        ctx (torch.autograd.function.Context): The context object for `autograd.Function`.
-            It is used to save tensors like Q, K, V, O, and L for the backward pass.
-        Q (torch.Tensor): The query tensor.
-        K (torch.Tensor): The key tensor.
-        V (torch.Tensor): The value tensor.
-        is_causal (bool, optional): If True, a causal mask is applied to prevent
-            attention to future tokens. Defaults to False.
+    K_block_ptr = tl.make_block_ptr(
+        K_ptr + batch_index * stride_kb,  # select the k-th batch index
+        shape=(N_KEYS, D),
+        strides=(stride_kk, stride_kd),
+        offsets=(0, 0),                   # no offsets, will iterate all later    
+        block_shape=(K_TILE_SIZE, D),
+        order=(1,0)
+    )
 
-    Returns:
-        torch.Tensor: The attention output tensor `O`.
+    V_block_ptr = tl.make_block_ptr(
+        V_ptr + batch_index * stride_vb,  # select the k-th batch index
+        shape=(N_KEYS, D),
+        strides=(stride_vk, stride_vd),
+        offsets=(0, 0),                   # no offsets, will iterate all later    
+        block_shape=(K_TILE_SIZE, D),
+        order=(1,0)
+    )
 
-    Notes:
-        - The implementation should use a tiled algorithm. Tile sizes can be
-        chosen by the implementer but should be at least 16x16.
-        - Input tensor dimensions will always be clean powers of 2 and at least 16,
-        so out-of-bounds accesses do not need to be handled.
-        - The backward method for this function should be defined but can simply
-        raise `NotImplementedError` for this task.
-        - The log-sum-exp value `L` should be calculated and saved to the context
-        using `ctx.save_for_backward()` for the (unimplemented) backward pass.
-    """
-    pass
+    O_block_ptr = tl.make_block_ptr(
+        O_ptr + batch_index * stride_ob,           # select the k-th batch index
+        shape=(N_QUERIES, D),
+        strides=(stride_oq, stride_od),
+        offsets=(query_tile_idx * Q_TILE_SIZE, 0), # select the i-th tile index
+        block_shape=(Q_TILE_SIZE, D),
+        order=(1,0)
+    )
+
+    L_block_ptr = tl.make_block_ptr(
+        L_ptr + batch_index * stride_lb,           # select the k-th batch index
+        shape=(N_QUERIES,),
+        strides=(stride_lq,),
+        offsets=(query_tile_idx * Q_TILE_SIZE,),   # select the i-th tile index
+        block_shape=(Q_TILE_SIZE,),
+        order=(0,)
+    )
+    
+    # Load query tile
+    Qi = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")     # (Q_TILE_SIZE, d)
+    Oi = tl.zeros([Q_TILE_SIZE, D], dtype=tl.float32)                           # (Q_TILE_SIZE, d) 
+    mi = tl.zeros([Q_TILE_SIZE], dtype=tl.float32) - float('inf')               # (Q_TILE_SIZE,)
+    li = tl.zeros([Q_TILE_SIZE], dtype=tl.float32)                              # (Q_TILE_SIZE,)
+    input_dtype = Q_block_ptr.type.element_ty                                   # can be (fp16, bf16, or fp32)
+
+    for j in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
+        # Load key and value tiles       
+        Kj = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, d)
+        Vj = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, d)
+
+        # Computation
+        Sij        = tl.dot(Qi, Kj.T) * scale
+        mi_next    = tl.maximum(mi, tl.max(Sij, axis=-1))
+        Pij        = tl.exp(Sij - mi_next[:, None])
+        li_next    = tl.exp(mi - mi_next) * li + tl.sum(Pij, axis=-1)
+        Oi_next    = tl.exp(mi - mi_next)[:, None] * Oi \
+                     + tl.dot(Pij.to(input_dtype), Vj) # downcastting
+        mi, li, Oi = mi_next, li_next, Oi_next
+
+        # Advance pointers
+        K_block_ptr = tl.advance(K_block_ptr, (K_TILE_SIZE, 0))
+        V_block_ptr = tl.advance(V_block_ptr, (K_TILE_SIZE, 0))
+ 
+    # Normalize output by final denominator (fp32)
+    Oi = Oi / li[:, None]
+    
+    # Compute logsumexp for backward pass (fp32)
+    Li = mi + tl.log(li)
+
+    # Write tile results back
+    tl.store(O_block_ptr, Oi.to(input_dtype), boundary_check=(0, 1))
+    tl.store(L_block_ptr, Li.to(input_dtype), boundary_check=(0,))
+
 
 
 def _make_attn_inputs(
     device=None,
     dtype=torch.float32,
     batch_size=8,
-    n_queries=128,
-    n_keys=128,
+    n_queries=512,
+    n_keys=512,
     head_dim=64
 ):
-    torch.random.manual_seed(42)
+    # torch.random.manual_seed(42)
     q = torch.randn(batch_size, n_queries, head_dim, device=device, dtype=dtype, requires_grad=True)
     k = torch.randn(batch_size, n_keys, head_dim, device=device, dtype=dtype, requires_grad=True)
     v = torch.randn(batch_size, n_keys, head_dim, device=device, dtype=dtype, requires_grad=True)
@@ -389,20 +453,41 @@ def _make_attn_inputs(
     return q, k, v, do
 
 if __name__ == "__main__":
-    Q, K, V, dO = _make_attn_inputs(device="cpu")
-    # manual_outputs = scaled_dot_product_attention(Q, K, V)
-    S_ref, L_ref, O_ref, P_ref = attention_debug(Q, K, V, is_causal=False)
-    S_debug, L_debug, O = FlashAttentionPytorch.apply(Q, K, V, False)
-    print(f"S_ref: {S_ref}")
-    print(f"L_ref: {L_ref}")
-    print(f"O_ref: {O_ref}")
-    print(f"P_ref: {P_ref}")
-    print("---------------")
-    print(f"S_debug: {S_debug}")
-    print(f"L_debug: {L_debug}")
-    print(f"O_debug: {O}")
-    # print(f"P_debug: {P_debug}")
+    Q, K, V, dO = _make_attn_inputs(device="cuda:0", dtype=torch.bfloat16)
+    
+    # Run all implementations
+    S_ref, O_ref = AttentionPytorch.apply(Q, K, V, False, True)
+    S_debug, O_debug = FlashAttentionPytorch.apply(Q, K, V, False, True)
+    O_triton = FlashAttentionTriton.apply(Q, K, V, False)
+    
+    # Extract L values
+    L_ref = O_ref.grad_fn.saved_tensors[0]
+    L_debug = O_debug.grad_fn.saved_tensors[0]
+    L_triton = O_triton.grad_fn.saved_tensors[0]
+    
+    # Log all outputs
+    logger.info(f"S_ref: {S_ref}")
+    logger.info(f"L_ref: {L_ref}")
+    logger.info(f"O_ref: {O_ref}")
+    logger.info("-" * 50)
+    logger.info(f"S_debug: {S_debug}")
+    logger.info(f"L_debug: {L_debug}")
+    logger.info(f"O_debug: {O_debug}")
+    logger.info("-" * 50)
+    logger.info(f"L_triton: {L_triton}")
+    logger.info(f"O_triton: {O_triton}")
+        
+    # Test PyTorch debug vs reference
+    logger.info("Testing PyTorch debug implementation...")
     torch.testing.assert_close(S_ref, S_debug, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(L_ref, L_debug, rtol=1e-2, atol=1e-2)
-    torch.testing.assert_close(O_ref, O, rtol=1e-2, atol=1e-2)
-    # print("lovely tensors")
+    torch.testing.assert_close(O_ref, O_debug, rtol=1e-2, atol=1e-2)
+    logger.info("✓ PyTorch debug matches reference")
+    
+    # Test Triton vs reference
+    logger.info("Testing Triton implementation...")
+    torch.testing.assert_close(O_triton, O_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(L_triton, L_ref, rtol=1e-2, atol=1e-2)
+    logger.info("✓ Triton matches reference")
+    
+    logger.info("✓ All tests passed!")
